@@ -144,7 +144,7 @@ void http_ssl_global_fini(void)
     return;
 }
 
-HTTP_CONN_ST * http_ssl_conn_creat(void)
+HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname)
 {
     HTTP_CONN_ST *conn = NULL;
 
@@ -153,7 +153,7 @@ HTTP_CONN_ST * http_ssl_conn_creat(void)
         return NULL;
     }
 
-    conn ->skfd = http_tcp_connect("apis.t2.5itianyuan.com", 443);
+    conn ->skfd = http_tcp_connect(hostname, 443);
     if (conn->skfd < 0) {
         goto error;
     }
@@ -249,28 +249,61 @@ char *http_ssl_read(HTTP_CONN_ST *conn)
     return rc;
 }
 
-int main(void)
+#if 0
+const char *post_data = "POST /smarthome-api/v1.1/gateway/signup HTTP/1.1\r\n"
+"cache-control: no-cache\r\n"
+"User-Agent: PostmanRuntime/7.1.1\r\n"
+"Accept: */*\r\n"
+"Host: apis.t2.5itianyuan.com\r\n"
+"content-type: application/x-www-form-urlencoded\r\n"
+"accept-encoding: gzip, deflate\r\n"
+"content-length: 345\r\n"
+"Connection: keep-alive\r\n"
+"\r\n"
+
+"gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
+#endif
+
+static const char *g_http_post_header_fmt  = 
+"POST %s HTTP/1.1\r\n"
+"cache-control: no-cache\r\n"
+"User-Agent: %s\r\n"
+"Accept: */*\r\n"
+"Host: %s\r\n"
+"content-type: application/x-www-form-urlencoded\r\n"
+"accept-encoding: gzip, deflate\r\n"
+"content-length: %d\r\n"
+"Connection: keep-alive\r\n"
+"\r\n"
+"%s" ;
+
+int http_ssl_post()
 {
     HTTP_CONN_ST *conn = NULL;
+    char http_data[1024];
 
-    http_ssl_global_init();
-    
-    const char *post_data = "POST /smarthome-api/v1.1/gateway/signup HTTP/1.1\r\n"
-            "cache-control: no-cache\r\n"
-            "Postman-Token: 3ecc6216-724b-4d71-bf17-4e13ae57618a\r\n"
-            "User-Agent: PostmanRuntime/7.1.1\r\n"
-            "Accept: */*\r\n"
-            "Host: apis.t2.5itianyuan.com\r\n"
-            "content-type: application/x-www-form-urlencoded\r\n"
-            "accept-encoding: gzip, deflate\r\n"
-            "content-length: 345\r\n"
-            "Connection: keep-alive\r\n"
-            "\r\n"
-    
-            "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
-    conn = http_ssl_conn_creat();
-    http_ssl_write(conn, post_data, strlen(post_data));
+    conn = http_ssl_conn_creat("apis.t2.5itianyuan.com");
+
+const char *post_data = "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
+
+    snprintf(http_data, sizeof(http_data), g_http_post_header_fmt, 
+        "/smarthome-api/v1.1/gateway/signup",
+        "POSTMAN",
+        "apis.t2.5itianyuan.com",
+        strlen(post_data), post_data);
+
+    http_ssl_write(conn, http_data, strlen(http_data));
+
     http_ssl_read(conn);
+
+    return 0;
+}
+
+int main(void)
+{
+    http_ssl_global_init();
+   
+    http_ssl_post();
 
     http_ssl_global_fini();
 
