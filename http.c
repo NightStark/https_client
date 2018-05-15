@@ -9,11 +9,14 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <fcntl.h>
 
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <event2/event.h>
+
+#include <ares.h>  
 
 #define TYSCC_LOG(p, fmt, ...) \
     printf("[%s][%d]" fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
@@ -23,12 +26,18 @@ static struct event *g_http_timer_evt = NULL;
 
 typedef struct
 {
+    char hostname[256];
+    int port;
     int skfd;
     SSL *ssl_handle;
     SSL_CTX *ssl_ctx;
+    char http_data[1024];
 }HTTP_CONN_ST;
 
-HTTP_CONN_ST * http_conn_create(void)
+int http_ssl_write(HTTP_CONN_ST *conn, const char *text, int len);
+char *http_ssl_read(HTTP_CONN_ST *conn);
+
+HTTP_CONN_ST * http_conn_create(const char *hostname, int port)
 {
     HTTP_CONN_ST *conn = NULL;
 
@@ -37,6 +46,9 @@ HTTP_CONN_ST * http_conn_create(void)
         return NULL;
     }
     memset(conn, 0, sizeof(HTTP_CONN_ST));
+    
+    snprintf(conn->hostname, sizeof(conn->hostname), "%s", hostname);
+    conn->port = port;
 
     return conn;
 }
@@ -82,15 +94,127 @@ int http_get_host(const char *hostname, unsigned int *ipaddr)
     return -1;
 }       
 
-int http_tcp_connect(const char *hostname, int port)
+#if 0
+#define IP_LEN       (32)
+#define IP_COUNT_MAX (5)
+
+typedef struct {                                   
+    char host[64];
+    char ip[IP_COUNT_MAX][IP_LEN];   
+    int count;
+}IP_LIST_ST;
+
+
+void http_dns_callback(void* arg, int status, int timeouts, struct hostent* hptr)
+{
+    int i = 0;
+    char **pptr = NULL;
+    IP_LIST_ST *ips = NULL;
+
+    if (NULL == arg) {
+        return;
+    }
+
+    if(status != ARES_SUCCESS) {
+        printf("lookup failed: %d\n", status);
+        return;
+    }
+
+    ips = (IP_LIST_ST *)arg;
+
+    pptr=hptr->h_addr_list;  
+    for(i = 0; *pptr != NULL && i < IP_COUNT_MAX; pptr++, i++){
+        inet_ntop(hptr->h_addrtype, *pptr, ips->ip[i], IP_LEN);
+        printf("h_addr:%s\n", ips->ip[i]);
+        ips->count++;
+    }
+
+    return;
+}
+
+void main_loop(ares_channel channel)
+{
+    int nfds, count;
+    fd_set readers, writers;
+    struct timeval tv, *tvp;
+    while (1) {
+        FD_ZERO(&readers);
+        FD_ZERO(&writers);
+        nfds = ares_fds(channel, &readers, &writers);
+        if (nfds == 0)
+            break;
+        tvp = ares_timeout(channel, NULL, &tv);       
+        count = select(nfds, &readers, &writers, NULL, tvp);
+        ares_process(channel, &readers, &writers);
+    }
+}
+
+
+int http_get_host_async(const char *hostname)
+{
+    int ret = -1;
+    
+    ares_channel ares_ch; 
+
+    ret = ares_init(&ares_ch);
+    if (ret != ARES_SUCCESS) {
+        TYSCC_LOG(LOG_ERR, "ares init failed.");
+        return -1;
+    }
+
+    IP_LIST_ST ips;
+    //ares_set_servers_csv(channel, "114.114.114.114");
+    ares_gethostbyname(ares_ch, hostname, AF_INET, http_dns_callback, (void *)&ips);
+
+    nfds = ares_fds(channel, &readers, &writers);
+     
+    return 0;
+}
+#endif
+
+int http_ssl_connect(HTTP_CONN_ST *conn);
+
+static void http_conn_cb(int fd, short event, void *arg)
+{
+    int iRet = -1;
+	int error = 0;
+	int len   = sizeof(error);
+    HTTP_CONN_ST *conn = NULL;
+
+    conn = (HTTP_CONN_ST *)arg;
+    TYSCC_LOG(LOG_DEBUG, "conn evt, fd:%d, skfd:%d, event:%d", fd, conn->skfd, event);
+
+    if (!(event & EV_WRITE)) {
+        return;
+    }
+    
+    iRet = getsockopt(conn->skfd, 
+            SOL_SOCKET, 
+            SO_ERROR, 
+            &error, 
+            (socklen_t *)&len);
+    if (0 != iRet || 0 != error) {
+        TYSCC_LOG(LOG_ERR, "EPOLL get EPOLLOUT but connect UnSuccess!");
+        return;
+    }
+
+    TYSCC_LOG(LOG_ERR, "Server Connect Success!");
+
+    http_ssl_connect((HTTP_CONN_ST *)arg);
+
+    return;
+}
+
+int http_tcp_connect(HTTP_CONN_ST *conn)
 {
     unsigned int ipaddr = 0;
     char ip_buf[64] = {0};
     int error = -1, handle = -1;
     struct sockaddr_in server;
 
-    if (http_get_host(hostname, &ipaddr) < 0) {
-        TYSCC_LOG(LOG_ERR, "get host of [%s], failed.", hostname);
+    //TODO: can create a cache
+    if (http_get_host(conn->hostname, &ipaddr) < 0) {
+        TYSCC_LOG(LOG_ERR, "get host of [%s], failed.", conn->hostname);
         return -1;
     }
 
@@ -102,18 +226,34 @@ int http_tcp_connect(const char *hostname, int port)
         TYSCC_LOG(LOG_ERR, "create socket failed.");
         return -1;
     }
+    evutil_make_socket_nonblocking(handle);
 
     server.sin_family = AF_INET;
-    server.sin_port = htons(port);
+    server.sin_port = htons(conn->port);
     server.sin_addr.s_addr = ipaddr;
     bzero (&(server.sin_zero), 8);
 
-    error = connect(handle, (struct sockaddr *)&server,
-            sizeof(struct sockaddr));
+    //fcntl(handle, F_SETFL, O_NONBLOCK);
+
+    error = connect(handle, (struct sockaddr *)&server, sizeof(struct sockaddr));
     if (error < 0) {
-        TYSCC_LOG(LOG_ERR, "connect to [%s](%s) failed.", hostname, ip_buf);
+        if(EINPROGRESS != errno) {
+            TYSCC_LOG(LOG_ERR, "connect to [%s](%s) failed. errno:%d", conn->hostname, ip_buf, errno);
+            goto error;
+        } else {
+            TYSCC_LOG(LOG_DEBUG, "connect in process");
+        }
+    }
+
+    struct event *sk_conn_evt = NULL;
+    sk_conn_evt = event_new(g_http_evt_base, handle, EV_WRITE | /* EV_PERSIST | */EV_ET, http_conn_cb, conn); 
+    if (sk_conn_evt == NULL) {
+        TYSCC_LOG(LOG_DEBUG, "event new failed");
         goto error;
     }
+
+
+    event_add(sk_conn_evt, NULL);
 
     return handle;
 
@@ -153,15 +293,118 @@ HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname)
 {
     HTTP_CONN_ST *conn = NULL;
 
-    conn = http_conn_create();
+    conn = http_conn_create(hostname, 443);
     if (NULL == conn) {
         return NULL;
     }
 
-    conn ->skfd = http_tcp_connect(hostname, 443);
+    conn ->skfd = http_tcp_connect(conn);
     if (conn->skfd < 0) {
-        goto error;
     }
+
+    return conn;
+}
+
+static int http_ssl_do_connect(HTTP_CONN_ST *conn)
+{
+    int ret = -1;
+    int ret_err = -1;
+
+    /* Initiate SSL handshake */
+    ret = SSL_connect (conn->ssl_handle);
+    if (ret < 0) {
+        ERR_print_errors_fp (stderr);
+        TYSCC_LOG(LOG_ERR, "ssl connect failed. errno:%d", errno);
+        ret_err = SSL_get_error(conn->ssl_handle, ret);
+        if (ret_err == SSL_ERROR_WANT_READ) {
+            TYSCC_LOG(LOG_DEBUG, "ssl connect not compeleed.reed reconned.[%d:%d], ", 
+                    ret_err, SSL_ERROR_WANT_READ);
+            return SSL_ERROR_WANT_READ;
+        } else {
+            char acBuf[256];
+            TYSCC_LOG(LOG_ERR, "Connected Failed.");
+            //SSL_ShowCerts(conn->ssl_handle, acBuf, sizeof(acBuf));
+            //TYSCC_LOG(LOG_ERR, "%s", acBuf);
+            return -1;
+        }
+    } 
+
+    TYSCC_LOG(LOG_ERR, "Connected Success. with %s encryption\n", SSL_get_cipher(conn->ssl_handle));
+
+    return 0;
+}
+
+
+static void http_ssl_read_cb(int fd, short event, void *arg)
+{
+    HTTP_CONN_ST *conn = NULL;
+
+    TYSCC_LOG(LOG_DEBUG, "ssl read evt handle. event:%d.", event);
+    conn = (HTTP_CONN_ST *)arg;
+
+    if (event & EV_READ) {
+        TYSCC_LOG(LOG_DEBUG, "ssl write evt.");
+    }
+
+    if (event & EV_READ) {
+        char buf[4096] = {0};
+        int ret = -1;
+        int ret_err = -1;
+        //do {
+            memset(buf, 0, sizeof(buf));
+            ret = SSL_read(conn->ssl_handle, buf, sizeof(buf));
+            TYSCC_LOG(LOG_DEBUG, "ssl read evt handle. errno:%d.", errno);
+            ret_err = SSL_get_error(conn->ssl_handle, ret);
+        //} while(errno == EAGAIN);
+        //} while (ret_err == SSL_ERROR_WANT_READ);
+        TYSCC_LOG(LOG_ERR, "buf[%s].ret_err[%d]", buf, ret_err);
+    }
+    
+    return;
+}
+
+static void http_ssl_conn_cb(int fd, short event, void *arg)
+{
+    HTTP_CONN_ST *conn = NULL;
+
+    TYSCC_LOG(LOG_DEBUG, "ssl conn success, event:%d", event);
+    
+    conn = (HTTP_CONN_ST *)arg;
+
+    if (!(event & EV_READ)) {
+        return;
+    }
+
+    if (http_ssl_do_connect(conn) != 0) {
+        TYSCC_LOG(LOG_DEBUG, "ssl connect not complete, skip.");
+        return;
+    }
+
+    http_ssl_write(conn, conn->http_data, strlen(conn->http_data));
+
+    struct event *ssl_read_evt = NULL;
+    /*
+    ssl_read_evt = event_new(g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_read_cb, conn); 
+    if (ssl_read_evt == NULL) {
+        TYSCC_LOG(LOG_DEBUG, "event new failed");
+        return;
+    }
+    */
+    ssl_read_evt = event_new(g_http_evt_base, -1, 0, NULL, NULL); 
+    if (ssl_read_evt == NULL) {
+        TYSCC_LOG(LOG_DEBUG, "event new failed");
+        return;
+    }
+
+    event_assign(ssl_read_evt, g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_read_cb, (void *)conn);
+
+    event_add(ssl_read_evt, NULL);
+
+    return;
+}
+
+int http_ssl_connect(HTTP_CONN_ST *conn)
+{
 
     conn->ssl_ctx = SSL_CTX_new(SSLv23_client_method ());
     if (conn->ssl_ctx  == NULL) {
@@ -185,14 +428,20 @@ HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname)
         goto error;
     }
 
-    /* Initiate SSL handshake */
-    if (SSL_connect (conn->ssl_handle) != 1) {
-        ERR_print_errors_fp (stderr);
-        TYSCC_LOG(LOG_ERR, "ssl connect failed.");
+    http_ssl_do_connect(conn);
+
+    struct event *ssl_conn_evt = NULL;
+    ssl_conn_evt = event_new(g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_conn_cb, conn); 
+    if (ssl_conn_evt == NULL) {
+        TYSCC_LOG(LOG_DEBUG, "event new failed");
         goto error;
     }
 
-    return conn;
+
+    event_add(ssl_conn_evt, NULL);
+
+
+    return 0;
 
 error:
     if (conn) {
@@ -205,7 +454,7 @@ error:
         }
         http_conn_destroy(conn);
     }
-    return NULL;
+    return -1;
 }
 
 int http_ssl_write(HTTP_CONN_ST *conn, const char *text, int len)
@@ -218,6 +467,8 @@ int http_ssl_write(HTTP_CONN_ST *conn, const char *text, int len)
     }
 
     ret = SSL_write (conn->ssl_handle, text, len);
+    printf("ret = [%d] errno:%d\n", ret, errno);
+
 
     return ret;
 }
@@ -246,8 +497,18 @@ char *http_ssl_read(HTTP_CONN_ST *conn)
         if (received > 0) {
             count += received;
         }
+        if (received < 0) {
+            TYSCC_LOG(LOG_DEBUG, "errno:%d", errno);
+            /*
+            if (errno == EAGAIN) {
+                continue;
+            }
+            */
+            break;
+        }
         if (received < buffer_size - count)
             break;
+
     }
     printf("buf=[%s]\n", rc);
 
@@ -285,21 +546,19 @@ static const char *g_http_post_header_fmt  =
 int http_ssl_post()
 {
     HTTP_CONN_ST *conn = NULL;
-    char http_data[1024];
 
     conn = http_ssl_conn_creat("apis.t2.5itianyuan.com");
+    if (!conn) {
+        return -1;
+    }
 
 const char *post_data = "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
 
-    snprintf(http_data, sizeof(http_data), g_http_post_header_fmt, 
+    snprintf(conn->http_data, sizeof(conn->http_data), g_http_post_header_fmt, 
         "/smarthome-api/v1.1/gateway/signup",
         "POSTMAN",
         "apis.t2.5itianyuan.com",
         strlen(post_data), post_data);
-
-    http_ssl_write(conn, http_data, strlen(http_data));
-
-    http_ssl_read(conn);
 
     return 0;
 }
@@ -308,7 +567,7 @@ struct timeval g_timeout;
 static void http_timer_cb(int fd, short kind, void *userp)
 {
 
-    //TYSCC_LOG(LOG_DEBUG, "------------------");
+    TYSCC_LOG(LOG_DEBUG, "------------------");
 
     evtimer_add(g_http_timer_evt, &g_timeout);
 
