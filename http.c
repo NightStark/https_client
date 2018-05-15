@@ -377,6 +377,7 @@ static void http_ssl_conn_cb(int fd, short event, void *arg)
         return;
     }
 
+    /* NB:http_ssl_do_connect 是必须的，因为SSL_connect可能并没有真正的完成 !!!!!!!! */
     if (http_ssl_do_connect(conn) != 0) {
         TYSCC_LOG(LOG_DEBUG, "ssl connect not complete, skip.");
         return;
@@ -384,21 +385,6 @@ static void http_ssl_conn_cb(int fd, short event, void *arg)
 
     http_ssl_write(conn, conn->http_data, strlen(conn->http_data));
     event_del(conn->ssl_evt);
-
-    /*
-    struct event *ssl_read_evt = NULL;
-    ssl_read_evt = event_new(g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_read_cb, conn); 
-    if (ssl_read_evt == NULL) {
-        TYSCC_LOG(LOG_DEBUG, "event new failed");
-        return;
-    }
-    ssl_read_evt = event_new(g_http_evt_base, -1, 0, NULL, NULL); 
-    if (ssl_read_evt == NULL) {
-        TYSCC_LOG(LOG_DEBUG, "event new failed");
-        return;
-    }
-    event_add(ssl_read_evt, NULL);
-    */
 
     event_assign(conn->ssl_evt, g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_read_cb, (void *)conn);
     event_add(conn->ssl_evt, NULL);
@@ -432,17 +418,6 @@ int http_ssl_connect(HTTP_CONN_ST *conn)
     }
 
     http_ssl_do_connect(conn);
-
-    #if 0
-    struct event *ssl_conn_evt = NULL;
-    ssl_conn_evt = event_new(g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_conn_cb, conn); 
-    if (ssl_conn_evt == NULL) {
-        TYSCC_LOG(LOG_DEBUG, "event new failed");
-        goto error;
-    }
-
-    event_add(ssl_conn_evt, NULL);
-    #endif
 
     event_assign(conn->ssl_evt, g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_conn_cb, (void *)conn);
     event_add(conn->ssl_evt, NULL);
