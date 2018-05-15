@@ -8,13 +8,18 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <pthread.h>
 
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <event2/event.h>
 
 #define TYSCC_LOG(p, fmt, ...) \
     printf("[%s][%d]" fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
+
+static struct event_base *g_http_evt_base = NULL;
+static struct event *g_http_timer_evt = NULL;
 
 typedef struct
 {
@@ -299,11 +304,65 @@ const char *post_data = "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&ven
     return 0;
 }
 
+struct timeval g_timeout;
+static void http_timer_cb(int fd, short kind, void *userp)
+{
+
+    //TYSCC_LOG(LOG_DEBUG, "------------------");
+
+    evtimer_add(g_http_timer_evt, &g_timeout);
+
+    return;
+}
+
+static int http_timer_init(void)
+{
+    g_http_timer_evt = evtimer_new(g_http_evt_base, http_timer_cb, NULL);
+	if (NULL == g_http_timer_evt) {
+		TYSCC_LOG(LOG_ERR, "event new failed.\n");
+        return -1;
+	}
+    g_timeout.tv_sec = 1;
+    g_timeout.tv_usec = 0;
+
+    evtimer_add(g_http_timer_evt, &g_timeout);
+
+    return 0;
+}
+
+void *http_worker(void *args)
+{
+    int ret = -1;
+
+    g_http_evt_base = event_base_new();
+    if (!g_http_evt_base) {
+        return NULL;
+    }
+
+    http_timer_init();
+
+    ret = event_base_dispatch(g_http_evt_base);
+    if (ret != 0) {
+        TYSCC_LOG(LOG_ERR, "event_base_dispatch error:%d", ret);
+        perror("event_base_dispatch");
+    }
+
+    return NULL;
+}
+
 int main(void)
 {
+    pthread_t tid;
+
     http_ssl_global_init();
-   
+
+    pthread_create(&tid, NULL, http_worker, NULL);
+
     http_ssl_post();
+
+    while (1) {
+        sleep(1);
+    }
 
     http_ssl_global_fini();
 
