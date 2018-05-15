@@ -16,6 +16,34 @@
 #define TYSCC_LOG(p, fmt, ...) \
     printf("[%s][%d]" fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
 
+typedef struct
+{
+    int skfd;
+    SSL *ssl_handle;
+    SSL_CTX *ssl_ctx;
+}HTTP_CONN_ST;
+
+HTTP_CONN_ST * http_conn_create(void)
+{
+    HTTP_CONN_ST *conn = NULL;
+
+    conn = malloc(sizeof(HTTP_CONN_ST));
+    if (NULL == conn) {
+        return NULL;
+    }
+    memset(conn, 0, sizeof(HTTP_CONN_ST));
+
+    return conn;
+}
+
+void http_conn_destroy(HTTP_CONN_ST *conn)
+{
+    free(conn);
+    conn = NULL;
+
+    return;
+}
+
 int http_get_host(const char *hostname, unsigned int *ipaddr)
 {
     int i;
@@ -57,6 +85,7 @@ int http_tcp_connect(const char *hostname, int port)
     struct sockaddr_in server;
 
     if (http_get_host(hostname, &ipaddr) < 0) {
+        TYSCC_LOG(LOG_ERR, "get host of [%s], failed.", hostname);
         return -1;
     }
 
@@ -77,7 +106,7 @@ int http_tcp_connect(const char *hostname, int port)
     error = connect(handle, (struct sockaddr *)&server,
             sizeof(struct sockaddr));
     if (error < 0) {
-        perror ("Connect");
+        TYSCC_LOG(LOG_ERR, "connect to [%s](%s) failed.", hostname, ip_buf);
         goto error;
     }
 
@@ -115,11 +144,70 @@ void http_ssl_global_fini(void)
     return;
 }
 
+HTTP_CONN_ST * http_ssl_conn_creat(void)
+{
+    HTTP_CONN_ST *conn = NULL;
+
+    conn = http_conn_create();
+    if (NULL == conn) {
+        return NULL;
+    }
+
+    conn ->skfd = http_tcp_connect("apis.t2.5itianyuan.com", 443);
+    if (conn->skfd < 0) {
+        goto error;
+    }
+
+    conn->ssl_ctx = SSL_CTX_new(SSLv23_client_method ());
+    if (conn->ssl_ctx  == NULL) {
+        ERR_print_errors_fp (stderr);
+        TYSCC_LOG(LOG_ERR, "ssl ctx new failed.");
+        goto error;
+    }
+
+    /* Create an SSL struct for the connection */
+    conn->ssl_handle = SSL_new(conn->ssl_ctx);
+    if (conn->ssl_handle == NULL) {
+        ERR_print_errors_fp (stderr);
+        TYSCC_LOG(LOG_ERR, "ssl new failed.");
+        goto error;
+    }
+
+    /* Connect the SSL struct to our connection */
+    if (!SSL_set_fd (conn->ssl_handle, conn->skfd)) {
+        ERR_print_errors_fp (stderr);
+        TYSCC_LOG(LOG_ERR, "ssl set fd failed.");
+        goto error;
+    }
+
+    /* Initiate SSL handshake */
+    if (SSL_connect (conn->ssl_handle) != 1) {
+        ERR_print_errors_fp (stderr);
+        TYSCC_LOG(LOG_ERR, "ssl connect failed.");
+        goto error;
+    }
+
+    return conn;
+
+error:
+    if (conn) {
+        if (conn->ssl_ctx) {
+            //TODO:ssl resources release.
+        }
+        if (conn->skfd > 0) {
+            close(conn->skfd);
+            conn->skfd = -1;
+        }
+        http_conn_destroy(conn);
+    }
+    return NULL;
+}
+
 int main(void)
 {
     http_ssl_global_init();
-
-    http_tcp_connect("apis.t2.5itianyuan.com", 443);
+    
+    http_ssl_conn_creat();
 
     http_ssl_global_fini();
 
