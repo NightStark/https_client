@@ -47,12 +47,9 @@ static void _dns_callback(int errcode, struct evutil_addrinfo *addr, void *ptr)
 
 struct evdns_base * setup_evdns_base(struct event_base *base)
 {
-    if(g_dnsbase)
-    {
+    if(g_dnsbase) {
         return g_dnsbase;
-    }
-    else
-    {
+    } else {
         struct evdns_base * dnsbase = 0;
 #if defined(_WIN32)
         dnsbase = evdns_base_new(base, 0);

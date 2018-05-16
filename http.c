@@ -15,14 +15,15 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <event2/event.h>
-
-#include <ares.h>  
+#include <event2/util.h>
+#include <event2/dns.h>
 
 #define TYSCC_LOG(p, fmt, ...) \
     printf("[%s][%d]" fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
 
 static struct event_base *g_http_evt_base = NULL;
 static struct event *g_http_timer_evt = NULL;
+struct evdns_base * g_http_evdns_base = 0; //TODO:need a lock?
 
 typedef struct
 {
@@ -32,6 +33,7 @@ typedef struct
     SSL *ssl_handle;
     SSL_CTX *ssl_ctx;
     struct event *ssl_evt;
+    struct evdns_base *evdns_base;
     char http_data[1024];
 }HTTP_CONN_ST;
 
@@ -62,6 +64,49 @@ void http_conn_destroy(HTTP_CONN_ST *conn)
     return;
 }
 
+struct evdns_base * http_setup_evdns_base(struct event_base *base)
+{
+    if(g_http_evdns_base) {
+        return g_http_evdns_base;
+    } else {
+        struct evdns_base * dnsbase = 0;
+#if defined(_WIN32)
+        dnsbase = evdns_base_new(base, 0);
+        evdns_base_nameserver_ip_add(dnsbase, "8.8.8.8");
+#elif defined(ANDROID)
+        dnsbase = evdns_base_new(base, 0);
+        {
+            int ret = 0;
+            int contains_default = 0;
+            char buf[PROP_VALUE_MAX];
+            ret = __system_property_get("net.dns1", buf);
+            if(ret >= 7)
+            {
+                if(!strncmp("8.8.8.8", buf, 7)) contains_default = 1;
+                evdns_base_nameserver_ip_add(dnsbase, buf);
+            }
+            ret = __system_property_get("net.dns2", buf);
+            if(ret >= 7)
+            {
+                if(!strncmp("8.8.8.8", buf, 7)) contains_default = 1;
+                evdns_base_nameserver_ip_add(dnsbase, buf);
+            }
+            if(!contains_default)
+            {
+                evdns_base_nameserver_ip_add(dnsbase, "8.8.8.8");
+            }
+        }
+#else
+        dnsbase = evdns_base_new(base, 1);
+#endif
+        printf(" dns server count : %d\n", evdns_base_count_nameservers(dnsbase));
+
+        g_http_evdns_base = dnsbase;
+        return dnsbase;
+    }
+}
+
+#if 0
 int http_get_host(const char *hostname, unsigned int *ipaddr)
 {
     int i;
@@ -93,7 +138,71 @@ int http_get_host(const char *hostname, unsigned int *ipaddr)
     }
 
     return -1;
-}       
+}
+#else
+
+static void http_evdns_callback(int errcode, struct evutil_addrinfo *addr, void *ptr)
+{
+    if (errcode) {
+        TYSCC_LOG(LOG_ERR, "%s -> %s\n", (char*)ptr, evutil_gai_strerror(errcode));
+    } else {
+        struct evutil_addrinfo *ai;
+        char ip[128];
+        TYSCC_LOG(LOG_DEBUG, "dns resolved,hostname - %s, ip :\n", (char*)ptr);
+        for (ai = addr; ai; ai = ai->ai_next) {
+            const char *s = NULL;
+            if (ai->ai_family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+                s = evutil_inet_ntop(AF_INET, &sin->sin_addr, ip, 128);
+            } else if (ai->ai_family == AF_INET6) {
+                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
+                s = evutil_inet_ntop(AF_INET6, &sin6->sin6_addr, ip, 128);
+            }
+            if(s) {
+                TYSCC_LOG(LOG_DEBUG, "  %s\n", s);
+            }
+        }
+    }
+
+    if(addr) {
+        evutil_freeaddrinfo(addr);
+    }
+
+    return;
+}
+
+int http_get_host(HTTP_CONN_ST *conn)
+{
+    struct evutil_addrinfo hints;
+    struct evdns_getaddrinfo_request *req;
+
+    conn->evdns_base = http_setup_evdns_base(g_http_evt_base);
+    if (!conn->evdns_base) {
+        TYSCC_LOG(LOG_ERR, "evdns setup error.");
+        return -1; 
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_flags = EVUTIL_AI_CANONNAME;
+    #if 0
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    #else
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    #endif
+
+    req = evdns_getaddrinfo(conn->evdns_base, conn->hostname, NULL ,
+            &hints, http_evdns_callback, (void*)conn);
+    if (req == NULL) {
+        TYSCC_LOG(LOG_ERR, "[request for %s returned immediately]\n", conn->hostname);
+        return -1;
+    }
+
+    return 0;
+}
+#endif
 
 #if 0
 #define IP_LEN       (32)
@@ -213,11 +322,17 @@ int http_tcp_connect(HTTP_CONN_ST *conn)
     int error = -1, handle = -1;
     struct sockaddr_in server;
 
+    #if 0
     //TODO: can create a cache
     if (http_get_host(conn->hostname, &ipaddr) < 0) {
+    #else
+    if (http_get_host(conn) < 0) {
+    #endif
         TYSCC_LOG(LOG_ERR, "get host of [%s], failed.", conn->hostname);
         return -1;
     }
+
+    return 0;
 
     inet_ntop(AF_INET, &ipaddr, ip_buf, sizeof(ip_buf));
     TYSCC_LOG(LOG_ERR, "ip:[%s]", ip_buf);
@@ -294,6 +409,8 @@ void http_ssl_global_fini(void)
 HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname)
 {
     HTTP_CONN_ST *conn = NULL;
+
+    sleep(1); //TODO: need wait dns_base_is on dispatch!!
 
     conn = http_conn_create(hostname, 443);
     if (NULL == conn) {
@@ -533,13 +650,13 @@ int http_ssl_post()
         return -1;
     }
 
-const char *post_data = "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
+    const char *post_data = "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
 
     snprintf(conn->http_data, sizeof(conn->http_data), g_http_post_header_fmt, 
-        "/smarthome-api/v1.1/gateway/signup",
-        "POSTMAN",
-        "apis.t2.5itianyuan.com",
-        strlen(post_data), post_data);
+            "/smarthome-api/v1.1/gateway/signup",
+            "POSTMAN",
+            "apis.t2.5itianyuan.com",
+            strlen(post_data), post_data);
 
     return 0;
 }
