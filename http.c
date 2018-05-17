@@ -21,6 +21,20 @@
 #define TYSCC_LOG(p, fmt, ...) \
     printf("[%s][%d]" fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
 
+static const char *g_http_post_header_fmt  = 
+"POST %s HTTP/1.1\r\n"
+"cache-control: no-cache\r\n"
+"User-Agent: %s\r\n"
+"Accept: */*\r\n"
+"Host: %s\r\n"
+"content-type: application/x-www-form-urlencoded\r\n"
+"accept-encoding: gzip, deflate\r\n"
+"content-length: %d\r\n"
+"Connection: keep-alive\r\n"
+"\r\n"
+"%s" ;
+
+
 static struct event_base *g_http_evt_base = NULL;
 static struct event *g_http_timer_evt = NULL;
 struct evdns_base * g_http_evdns_base = 0; //TODO:need a lock?
@@ -169,7 +183,9 @@ static void http_evdns_callback(int errcode, struct evutil_addrinfo *addr, void 
 
     if(s) {
         TYSCC_LOG(LOG_DEBUG, "  %s(%X)\n", s, ipaddr);
-        http_tcp_connect(conn, ipaddr);
+        if (http_tcp_connect(conn, ipaddr) < 0) {
+            return;
+        }
     }
 
     /*
@@ -270,7 +286,7 @@ void main_loop(ares_channel channel)
 }
 
 
-int http_get_host_async(const char *hostname)
+int _http_get_host_async(const char *hostname)
 {
     int ret = -1;
     
@@ -343,7 +359,9 @@ int http_request_start(HTTP_CONN_ST *conn)
     }
     #ifdef HTTP_DNS_ASYNC
     #else
-    http_tcp_connect(conn, ipaddr);
+    if (http_tcp_connect(conn, ipaddr) < 0) {
+        return -1;
+    }
     #endif
 
     return 0;
@@ -388,10 +406,9 @@ static int http_tcp_connect(HTTP_CONN_ST *conn, unsigned int ipaddr)
         TYSCC_LOG(LOG_DEBUG, "event new failed");
         goto error;
     }
-
+    conn->ssl_evt = sk_conn_evt; 
     event_add(sk_conn_evt, NULL);
 
-    conn->ssl_evt = sk_conn_evt; 
     TYSCC_LOG(LOG_DEBUG, "conn(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
 
     return handle;
@@ -428,7 +445,7 @@ void http_ssl_global_fini(void)
     return;
 }
 
-HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname)
+HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname, const char *req_data)
 {
     HTTP_CONN_ST *conn = NULL;
 
@@ -439,7 +456,14 @@ HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname)
         return NULL;
     }
 
+    snprintf(conn->http_data, sizeof(conn->http_data), g_http_post_header_fmt, 
+            "/smarthome-api/v1.1/gateway/signup",
+            "POSTMAN",
+            "apis.t2.5itianyuan.com",
+            strlen(req_data), req_data);
+
     if (http_request_start(conn) < 0) {
+        return NULL;
     }
 
     return conn;
@@ -520,9 +544,12 @@ static void http_ssl_conn_cb(int fd, short event, void *arg)
         TYSCC_LOG(LOG_DEBUG, "ssl connect not complete, skip.");
         return;
     }
-
-    http_ssl_write(conn, conn->http_data, strlen(conn->http_data));
     event_del(conn->ssl_evt);
+
+    if (http_ssl_write(conn, conn->http_data, strlen(conn->http_data)) < 0) {
+        TYSCC_LOG(LOG_ERR, "http ssl write failed.");
+        return;
+    }
 
     event_assign(conn->ssl_evt, g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_read_cb, (void *)conn);
     event_add(conn->ssl_evt, NULL);
@@ -555,7 +582,9 @@ int http_ssl_connect(HTTP_CONN_ST *conn)
         goto error;
     }
 
-    http_ssl_do_connect(conn);
+    if (http_ssl_do_connect(conn) < 0) {
+        goto error;
+    }
 
     event_assign(conn->ssl_evt, g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_conn_cb, (void *)conn);
     event_add(conn->ssl_evt, NULL);
@@ -649,35 +678,16 @@ const char *post_data = "POST /smarthome-api/v1.1/gateway/signup HTTP/1.1\r\n"
 "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
 #endif
 
-static const char *g_http_post_header_fmt  = 
-"POST %s HTTP/1.1\r\n"
-"cache-control: no-cache\r\n"
-"User-Agent: %s\r\n"
-"Accept: */*\r\n"
-"Host: %s\r\n"
-"content-type: application/x-www-form-urlencoded\r\n"
-"accept-encoding: gzip, deflate\r\n"
-"content-length: %d\r\n"
-"Connection: keep-alive\r\n"
-"\r\n"
-"%s" ;
-
 int http_ssl_post()
 {
     HTTP_CONN_ST *conn = NULL;
 
-    conn = http_ssl_conn_creat("apis.t2.5itianyuan.com");
+    const char *post_data = "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
+
+    conn = http_ssl_conn_creat("apis.t2.5itianyuan.com", post_data);
     if (!conn) {
         return -1;
     }
-
-    const char *post_data = "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
-
-    snprintf(conn->http_data, sizeof(conn->http_data), g_http_post_header_fmt, 
-            "/smarthome-api/v1.1/gateway/signup",
-            "POSTMAN",
-            "apis.t2.5itianyuan.com",
-            strlen(post_data), post_data);
 
     return 0;
 }
