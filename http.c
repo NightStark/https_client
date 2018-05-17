@@ -10,6 +10,7 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
@@ -17,6 +18,21 @@
 #include <event2/event.h>
 #include <event2/util.h>
 #include <event2/dns.h>
+
+#define __MUTEX_STATIC(M,I) static pthread_mutex_t M = I
+#define __MUTEX_LOCK(M) \
+do { \
+    pthread_mutex_lock(&(M)); \
+} while(0) 
+#define __MUTEX_TRYLOCK(M) pthread_mutex_trylock(&(M))
+#define __MUTEX_TIMEDLOCK(M, t) \
+do { \
+    pthread_mutex_timedlock(&(M), &(t)); \
+} while(0) 
+#define __MUTEX_UNLOCK(M) \
+do { \
+    pthread_mutex_unlock(&(M)); \
+} while(0) 
 
 #define TYSCC_LOG(p, fmt, ...) \
     printf("[%s][%d]" fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
@@ -34,10 +50,29 @@ static const char *g_http_post_header_fmt  =
 "\r\n"
 "%s" ;
 
-
 static struct event_base *g_http_evt_base = NULL;
 static struct event *g_http_timer_evt = NULL;
 struct evdns_base * g_http_evdns_base = 0; //TODO:need a lock?
+
+__MUTEX_STATIC(g_http_evt_base_mutex, PTHREAD_MUTEX_INITIALIZER);
+#define HTTP_EVT_BASE_LOCK __MUTEX_LOCK(g_http_evt_base_mutex)
+#define HTTP_EVT_BASE_UNLOCK __MUTEX_UNLOCK(g_http_evt_base_mutex)
+
+typedef enum http_conn_status
+{
+    HTTP_CONN_STATUS_INIT = 0,
+    HTTP_CONN_STATUS_ASYNC_DNS_REQ,
+    HTTP_CONN_STATUS_ASYNC_DNS_ERROR,
+    HTTP_CONN_STATUS_ASYNC_DNS_RESOLVED,
+    HTTP_CONN_STATUS_ASYNC_CONNECTING,
+    HTTP_CONN_STATUS_ASYNC_CONNECTED,
+    HTTP_CONN_STATUS_ASYNC_SSL_CONNECTING,
+    HTTP_CONN_STATUS_ASYNC_SSL_CONNECTED,
+    HTTP_CONN_STATUS_ASYNC_HTTP_SENDING,
+    HTTP_CONN_STATUS_ASYNC_HTTP_RESP_HANDLE,
+
+    _HTTP_CONN_STATUS_MAX_
+}HTTP_CONN_STATUS_EN;
 
 typedef struct
 {
@@ -49,6 +84,7 @@ typedef struct
     struct event *ssl_evt;
     struct evdns_base *evdns_base;
     char http_data[1024];
+    HTTP_CONN_STATUS_EN status;
 }HTTP_CONN_ST;
 
 int http_ssl_write(HTTP_CONN_ST *conn, const char *text, int len);
@@ -67,6 +103,7 @@ HTTP_CONN_ST * http_conn_create(const char *hostname, int port)
     
     snprintf(conn->hostname, sizeof(conn->hostname), "%s", hostname);
     conn->port = port;
+    conn->status = HTTP_CONN_STATUS_INIT;
 
     return conn;
 }
@@ -165,6 +202,7 @@ static void http_evdns_callback(int errcode, struct evutil_addrinfo *addr, void 
     conn = (HTTP_CONN_ST *)arg;
 
     if (errcode) {
+        conn->status = HTTP_CONN_STATUS_ASYNC_DNS_ERROR;
         TYSCC_LOG(LOG_ERR, "%s -> %s\n", conn->hostname, evutil_gai_strerror(errcode));
         return;
     }
@@ -183,6 +221,7 @@ static void http_evdns_callback(int errcode, struct evutil_addrinfo *addr, void 
 
     if(s) {
         TYSCC_LOG(LOG_DEBUG, "  %s(%X)\n", s, ipaddr);
+        conn->status = HTTP_CONN_STATUS_ASYNC_DNS_RESOLVED;
         if (http_tcp_connect(conn, ipaddr) < 0) {
             return;
         }
@@ -220,6 +259,7 @@ int http_get_host_async(HTTP_CONN_ST *conn)
     hints.ai_protocol = IPPROTO_UDP;
     #endif
 
+    conn->status = HTTP_CONN_STATUS_ASYNC_DNS_REQ;
     req = evdns_getaddrinfo(conn->evdns_base, conn->hostname, NULL ,
             &hints, http_evdns_callback, (void*)conn);
     if (req == NULL) {
@@ -336,6 +376,7 @@ static void http_conn_cb(int fd, short event, void *arg)
     }
 
     TYSCC_LOG(LOG_ERR, "Server Connect Success!");
+    conn->status = HTTP_CONN_STATUS_ASYNC_CONNECTED;
 
     http_ssl_connect((HTTP_CONN_ST *)arg);
 
@@ -399,6 +440,7 @@ static int http_tcp_connect(HTTP_CONN_ST *conn, unsigned int ipaddr)
         }
     }
     TYSCC_LOG(LOG_DEBUG, "conn(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
+    conn->status = HTTP_CONN_STATUS_ASYNC_CONNECTING;
 
     struct event *sk_conn_evt = NULL;
     sk_conn_evt = event_new(g_http_evt_base, handle, EV_WRITE | /* EV_PERSIST | */EV_ET, http_conn_cb, conn); 
@@ -449,7 +491,13 @@ HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname, const char *req_data)
 {
     HTTP_CONN_ST *conn = NULL;
 
-    sleep(1); //TODO: need wait dns_base_is on dispatch!!
+    HTTP_EVT_BASE_LOCK;
+    if (NULL == g_http_evt_base) {
+        TYSCC_LOG(LOG_ERR, "http evt base is not ready.");
+        HTTP_EVT_BASE_UNLOCK;
+        return NULL;
+    }
+    HTTP_EVT_BASE_UNLOCK;
 
     conn = http_conn_create(hostname, 443);
     if (NULL == conn) {
@@ -514,6 +562,7 @@ static void http_ssl_read_cb(int fd, short event, void *arg)
         char buf[4096] = {0};
         int ret = -1;
         int ret_err = -1;
+        conn->status = HTTP_CONN_STATUS_ASYNC_HTTP_RESP_HANDLE;
         //do {
             memset(buf, 0, sizeof(buf));
             ret = SSL_read(conn->ssl_handle, buf, sizeof(buf));
@@ -545,11 +594,13 @@ static void http_ssl_conn_cb(int fd, short event, void *arg)
         return;
     }
     event_del(conn->ssl_evt);
+    conn->status = HTTP_CONN_STATUS_ASYNC_SSL_CONNECTED;
 
     if (http_ssl_write(conn, conn->http_data, strlen(conn->http_data)) < 0) {
         TYSCC_LOG(LOG_ERR, "http ssl write failed.");
         return;
     }
+    conn->status = HTTP_CONN_STATUS_ASYNC_HTTP_SENDING;
 
     event_assign(conn->ssl_evt, g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_read_cb, (void *)conn);
     event_add(conn->ssl_evt, NULL);
@@ -585,6 +636,7 @@ int http_ssl_connect(HTTP_CONN_ST *conn)
     if (http_ssl_do_connect(conn) < 0) {
         goto error;
     }
+    conn->status = HTTP_CONN_STATUS_ASYNC_SSL_CONNECTING;
 
     event_assign(conn->ssl_evt, g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_conn_cb, (void *)conn);
     event_add(conn->ssl_evt, NULL);
@@ -684,9 +736,12 @@ int http_ssl_post()
 
     const char *post_data = "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
 
-    conn = http_ssl_conn_creat("apis.t2.5itianyuan.com", post_data);
-    if (!conn) {
-        return -1;
+    while(1) {
+        conn = http_ssl_conn_creat("apis.t2.5itianyuan.com", post_data);
+        if (conn) {
+            break;
+        }
+        usleep(1000);
     }
 
     return 0;
@@ -722,10 +777,13 @@ void *http_worker(void *args)
 {
     int ret = -1;
 
+    HTTP_EVT_BASE_LOCK;
     g_http_evt_base = event_base_new();
     if (!g_http_evt_base) {
+        HTTP_EVT_BASE_UNLOCK;
         return NULL;
     }
+    HTTP_EVT_BASE_UNLOCK;
 
     http_timer_init();
 
@@ -735,12 +793,63 @@ void *http_worker(void *args)
         perror("event_base_dispatch");
     }
 
+    TYSCC_LOG(LOG_DEBUG, "event_base_dispatch exit:%d", ret);
+
+    HTTP_EVT_BASE_LOCK;
+    event_base_free(g_http_evt_base);
+    g_http_evt_base = NULL;
+    HTTP_EVT_BASE_UNLOCK;
+
     return NULL;
+}
+
+void sa_s_handler(int iSigNum)
+{
+    int ret = 0;
+
+    TYSCC_LOG(LOG_DEBUG, "sig num = %d", iSigNum);
+
+    if (g_http_evt_base) {
+        ret = event_base_loopexit(g_http_evt_base, NULL);
+    }
+
+    sleep(10);
+
+    exit(0);
+
+    return;
+}
+
+int signal_init(void)
+{
+    int iRet = -1;
+    sigset_t SigMask;
+    struct sigaction sa_s;
+
+	iRet  = sigfillset(&SigMask);
+	if (iRet < 0)
+	{
+		TYSCC_LOG(LOG_ERR, "Signal set Failed!");
+        return -1;
+	}
+    sigset_t oldset;
+    sigprocmask(SIG_UNBLOCK, &SigMask, &oldset);
+    sigprocmask(SIG_BLOCK, NULL, &oldset);
+    memset(&sa_s, 0, sizeof(sa_s));
+    sa_s.sa_flags = 0;
+    sa_s.sa_handler = sa_s_handler;
+    //sigaction(SIGINT,  &sa_s, NULL);
+    sigaction(SIGQUIT, &sa_s, NULL);
+    //sigaction(SIGTERM, &sa_s, NULL);
+    
+    return 0;
 }
 
 int main(void)
 {
     pthread_t tid;
+
+    signal_init();
 
     http_ssl_global_init();
 
