@@ -39,6 +39,7 @@ typedef struct
 
 int http_ssl_write(HTTP_CONN_ST *conn, const char *text, int len);
 char *http_ssl_read(HTTP_CONN_ST *conn);
+static int http_tcp_connect(HTTP_CONN_ST *conn, unsigned int ipaddr);
 
 HTTP_CONN_ST * http_conn_create(const char *hostname, int port)
 {
@@ -106,7 +107,6 @@ struct evdns_base * http_setup_evdns_base(struct event_base *base)
     }
 }
 
-#if 0
 int http_get_host(const char *hostname, unsigned int *ipaddr)
 {
     int i;
@@ -127,8 +127,8 @@ int http_get_host(const char *hostname, unsigned int *ipaddr)
                 AF_INET, phost->h_length);
 
     for(i = 0; hostinfo.h_aliases[i];i++)
-        TYSCC_LOG(LOG_ERR, "alias is:%s",hostinfo.h_aliases[i]);
-    for(i = 0;hostinfo.h_addr_list[i];i++) {
+        TYSCC_LOG(LOG_ERR, "alias is:%s", hostinfo.h_aliases[i]);
+    for(i = 0; hostinfo.h_addr_list[i]; i++) {
         //TYSCC_LOG(LOG_ERR, "host addr is:%s",inet_ntoa(*(struct in_addr*)hostinfo.h_addr_list[i]));
         //inet_ntop(AF_INET, hostinfo.h_addr_list[i], ip_buf, buf_len);
         //TYSCC_LOG(LOG_ERR, "ip:[%s]", ip_buf);
@@ -139,39 +139,50 @@ int http_get_host(const char *hostname, unsigned int *ipaddr)
 
     return -1;
 }
-#else
 
-static void http_evdns_callback(int errcode, struct evutil_addrinfo *addr, void *ptr)
+static void http_evdns_callback(int errcode, struct evutil_addrinfo *addr, void *arg)
 {
+    char ip[128];
+    const char *s = NULL;
+    struct evutil_addrinfo *ai;
+    HTTP_CONN_ST *conn = NULL;
+    unsigned int ipaddr = 0;
+
+    conn = (HTTP_CONN_ST *)arg;
+
     if (errcode) {
-        TYSCC_LOG(LOG_ERR, "%s -> %s\n", (char*)ptr, evutil_gai_strerror(errcode));
-    } else {
-        struct evutil_addrinfo *ai;
-        char ip[128];
-        TYSCC_LOG(LOG_DEBUG, "dns resolved,hostname - %s, ip :\n", (char*)ptr);
-        for (ai = addr; ai; ai = ai->ai_next) {
-            const char *s = NULL;
-            if (ai->ai_family == AF_INET) {
-                struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
-                s = evutil_inet_ntop(AF_INET, &sin->sin_addr, ip, 128);
-            } else if (ai->ai_family == AF_INET6) {
-                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
-                s = evutil_inet_ntop(AF_INET6, &sin6->sin6_addr, ip, 128);
-            }
-            if(s) {
-                TYSCC_LOG(LOG_DEBUG, "  %s\n", s);
-            }
+        TYSCC_LOG(LOG_ERR, "%s -> %s\n", conn->hostname, evutil_gai_strerror(errcode));
+        return;
+    }
+
+    TYSCC_LOG(LOG_DEBUG, "dns resolved,hostname - %s, ip :\n", conn->hostname);
+    for (ai = addr; ai; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+            s = evutil_inet_ntop(AF_INET, &sin->sin_addr, ip, 128);
+            ipaddr = sin->sin_addr.s_addr;
+        } else if (ai->ai_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
+            s = evutil_inet_ntop(AF_INET6, &sin6->sin6_addr, ip, 128);
         }
     }
 
+    if(s) {
+        TYSCC_LOG(LOG_DEBUG, "  %s(%X)\n", s, ipaddr);
+        http_tcp_connect(conn, ipaddr);
+    }
+
+    /*
     if(addr) {
         evutil_freeaddrinfo(addr);
+        addr = NULL;
     }
+    */
 
     return;
 }
 
-int http_get_host(HTTP_CONN_ST *conn)
+int http_get_host_async(HTTP_CONN_ST *conn)
 {
     struct evutil_addrinfo hints;
     struct evdns_getaddrinfo_request *req;
@@ -202,7 +213,6 @@ int http_get_host(HTTP_CONN_ST *conn)
 
     return 0;
 }
-#endif
 
 #if 0
 #define IP_LEN       (32)
@@ -292,7 +302,8 @@ static void http_conn_cb(int fd, short event, void *arg)
     HTTP_CONN_ST *conn = NULL;
 
     conn = (HTTP_CONN_ST *)arg;
-    TYSCC_LOG(LOG_DEBUG, "conn evt, fd:%d, skfd:%d, event:%d", fd, conn->skfd, event);
+    TYSCC_LOG(LOG_DEBUG, "conn(0x%X) evt, fd:%d, skfd:%d, event:%d", 
+            (unsigned int)conn, fd, conn->skfd, event);
 
     if (!(event & EV_WRITE)) {
         return;
@@ -304,7 +315,7 @@ static void http_conn_cb(int fd, short event, void *arg)
             &error, 
             (socklen_t *)&len);
     if (0 != iRet || 0 != error) {
-        TYSCC_LOG(LOG_ERR, "EPOLL get EPOLLOUT but connect UnSuccess!");
+        TYSCC_LOG(LOG_ERR, "EPOLL get EPOLLOUT but connect UnSuccess! errno=%d", errno);
         return;
     }
 
@@ -315,51 +326,61 @@ static void http_conn_cb(int fd, short event, void *arg)
     return;
 }
 
-int http_tcp_connect(HTTP_CONN_ST *conn)
-{
-    unsigned int ipaddr = 0;
-    char ip_buf[64] = {0};
-    int error = -1, handle = -1;
-    struct sockaddr_in server;
+#define HTTP_DNS_ASYNC 1
 
-    #if 0
+int http_request_start(HTTP_CONN_ST *conn)
+{
+    #ifdef HTTP_DNS_ASYNC
+    if (http_get_host_async(conn) < 0) {
+    #else
+    unsigned int ipaddr = 0;
+
     //TODO: can create a cache
     if (http_get_host(conn->hostname, &ipaddr) < 0) {
-    #else
-    if (http_get_host(conn) < 0) {
     #endif
         TYSCC_LOG(LOG_ERR, "get host of [%s], failed.", conn->hostname);
         return -1;
     }
+    #ifdef HTTP_DNS_ASYNC
+    #else
+    http_tcp_connect(conn, ipaddr);
+    #endif
 
     return 0;
+}
 
-    inet_ntop(AF_INET, &ipaddr, ip_buf, sizeof(ip_buf));
-    TYSCC_LOG(LOG_ERR, "ip:[%s]", ip_buf);
+static int http_tcp_connect(HTTP_CONN_ST *conn, unsigned int ipaddr)
+{
+    int error = -1, handle = -1;
+    struct sockaddr_in server;
 
     handle = socket(AF_INET, SOCK_STREAM, 0);
     if (handle < 0) {
         TYSCC_LOG(LOG_ERR, "create socket failed.");
         return -1;
     }
-    evutil_make_socket_nonblocking(handle);
+    //evutil_make_socket_nonblocking(handle);
+    conn->skfd = handle;
+    TYSCC_LOG(LOG_DEBUG, "conn(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
 
     server.sin_family = AF_INET;
     server.sin_port = htons(conn->port);
     server.sin_addr.s_addr = ipaddr;
     bzero (&(server.sin_zero), 8);
 
-    //fcntl(handle, F_SETFL, O_NONBLOCK);
+    fcntl(handle, F_SETFL, O_NONBLOCK);
+    TYSCC_LOG(LOG_DEBUG, "conn(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
 
     error = connect(handle, (struct sockaddr *)&server, sizeof(struct sockaddr));
     if (error < 0) {
         if(EINPROGRESS != errno) {
-            TYSCC_LOG(LOG_ERR, "connect to [%s](%s) failed. errno:%d", conn->hostname, ip_buf, errno);
+            TYSCC_LOG(LOG_ERR, "connect to [%s](%X) failed. errno:%d", conn->hostname, ipaddr, errno);
             goto error;
         } else {
-            TYSCC_LOG(LOG_DEBUG, "connect in process");
+            TYSCC_LOG(LOG_DEBUG, "connect(skfd=%d) in process", handle);
         }
     }
+    TYSCC_LOG(LOG_DEBUG, "conn(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
 
     struct event *sk_conn_evt = NULL;
     sk_conn_evt = event_new(g_http_evt_base, handle, EV_WRITE | /* EV_PERSIST | */EV_ET, http_conn_cb, conn); 
@@ -371,6 +392,7 @@ int http_tcp_connect(HTTP_CONN_ST *conn)
     event_add(sk_conn_evt, NULL);
 
     conn->ssl_evt = sk_conn_evt; 
+    TYSCC_LOG(LOG_DEBUG, "conn(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
 
     return handle;
 
@@ -417,8 +439,7 @@ HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname)
         return NULL;
     }
 
-    conn ->skfd = http_tcp_connect(conn);
-    if (conn->skfd < 0) {
+    if (http_request_start(conn) < 0) {
     }
 
     return conn;
