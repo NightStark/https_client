@@ -116,6 +116,7 @@ void http_conn_destroy(HTTP_CONN_ST *conn)
     return;
 }
 
+#ifdef USE_LIB_EVT
 struct evdns_base * http_setup_evdns_base(struct event_base *base)
 {
     if(g_http_evdns_base) {
@@ -157,6 +158,7 @@ struct evdns_base * http_setup_evdns_base(struct event_base *base)
         return dnsbase;
     }
 }
+#endif
 
 int http_get_host(const char *hostname, unsigned int *ipaddr)
 {
@@ -191,6 +193,7 @@ int http_get_host(const char *hostname, unsigned int *ipaddr)
     return -1;
 }
 
+#ifdef USE_LIB_EVT
 static void http_evdns_callback(int errcode, struct evutil_addrinfo *addr, void *arg)
 {
     char ip[128];
@@ -269,6 +272,7 @@ int http_get_host_async(HTTP_CONN_ST *conn)
 
     return 0;
 }
+#endif
 
 #if 0
 #define IP_LEN       (32)
@@ -383,7 +387,7 @@ static void http_conn_cb(int fd, short event, void *arg)
     return;
 }
 
-#define HTTP_DNS_ASYNC 1
+//#define HTTP_DNS_ASYNC 0
 
 int http_request_start(HTTP_CONN_ST *conn)
 {
@@ -393,11 +397,13 @@ int http_request_start(HTTP_CONN_ST *conn)
     unsigned int ipaddr = 0;
 
     //TODO: can create a cache
+    TYSCC_LOG(LOG_ERR, "get host of [%s] start.", conn->hostname);
     if (http_get_host(conn->hostname, &ipaddr) < 0) {
     #endif
         TYSCC_LOG(LOG_ERR, "get host of [%s], failed.", conn->hostname);
         return -1;
     }
+
     #ifdef HTTP_DNS_ASYNC
     #else
     if (http_tcp_connect(conn, ipaddr) < 0) {
@@ -442,6 +448,7 @@ static int http_tcp_connect(HTTP_CONN_ST *conn, unsigned int ipaddr)
     TYSCC_LOG(LOG_DEBUG, "conn(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
     conn->status = HTTP_CONN_STATUS_ASYNC_CONNECTING;
 
+    #ifdef USE_LIB_EVT
     struct event *sk_conn_evt = NULL;
     sk_conn_evt = event_new(g_http_evt_base, handle, EV_WRITE | /* EV_PERSIST | */EV_ET, http_conn_cb, conn); 
     if (sk_conn_evt == NULL) {
@@ -450,8 +457,19 @@ static int http_tcp_connect(HTTP_CONN_ST *conn, unsigned int ipaddr)
     }
     conn->ssl_evt = sk_conn_evt; 
     event_add(sk_conn_evt, NULL);
+    TYSCC_LOG(LOG_DEBUG, "conn(%08X), sync, skfd:%d", (unsigned int)conn, conn->skfd);
+   #else
+    int ret = -1;
+    fd_set write_fds;
+    FD_ZERO(&write_fds);
+    FD_SET(handle, &write_fds);
+    ret = select(handle + 1,NULL, &write_fds, NULL, NULL);
+    if(FD_ISSET(handle, &write_fds)) {
+	    TYSCC_LOG(LOG_DEBUG, "conned(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
+	    http_ssl_connect(conn);
+    }
+    #endif
 
-    TYSCC_LOG(LOG_DEBUG, "conn(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
 
     return handle;
 
@@ -491,6 +509,7 @@ HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname, const char *req_data)
 {
     HTTP_CONN_ST *conn = NULL;
 
+    #ifdef USE_LIB_EVT
     HTTP_EVT_BASE_LOCK;
     if (NULL == g_http_evt_base) {
         TYSCC_LOG(LOG_ERR, "http evt base is not ready.");
@@ -498,6 +517,7 @@ HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname, const char *req_data)
         return NULL;
     }
     HTTP_EVT_BASE_UNLOCK;
+    #endif
 
     conn = http_conn_create(hostname, 443);
     if (NULL == conn) {
@@ -507,7 +527,7 @@ HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname, const char *req_data)
     snprintf(conn->http_data, sizeof(conn->http_data), g_http_post_header_fmt, 
             "/smarthome-api/v1.1/gateway/signup",
             "POSTMAN",
-            "apis.t2.5itianyuan.com",
+            hostname,
             strlen(req_data), req_data);
 
     if (http_request_start(conn) < 0) {
@@ -546,19 +566,8 @@ static int http_ssl_do_connect(HTTP_CONN_ST *conn)
     return 0;
 }
 
-
-static void http_ssl_read_cb(int fd, short event, void *arg)
+static int http_ssl_read_resp(HTTP_CONN_ST *conn)
 {
-    HTTP_CONN_ST *conn = NULL;
-
-    TYSCC_LOG(LOG_DEBUG, "ssl read evt handle. event:%d.", event);
-    conn = (HTTP_CONN_ST *)arg;
-
-    if (event & EV_READ) {
-        TYSCC_LOG(LOG_DEBUG, "ssl write evt.");
-    }
-
-    if (event & EV_READ) {
         char buf[4096] = {0};
         int ret = -1;
         int ret_err = -1;
@@ -571,6 +580,23 @@ static void http_ssl_read_cb(int fd, short event, void *arg)
         //} while(errno == EAGAIN);
         //} while (ret_err == SSL_ERROR_WANT_READ);
         TYSCC_LOG(LOG_ERR, "buf[%s].ret_err[%d]", buf, ret_err);
+}
+
+
+#ifdef USE_LIB_EVT
+static void http_ssl_read_cb(int fd, short event, void *arg)
+{
+    HTTP_CONN_ST *conn = NULL;
+
+    TYSCC_LOG(LOG_DEBUG, "ssl read evt handle. event:%d.", event);
+    conn = (HTTP_CONN_ST *)arg;
+
+    if (event & EV_READ) {
+        TYSCC_LOG(LOG_DEBUG, "ssl write evt.");
+    }
+
+    if (event & EV_READ) {
+	    http_ssl_read_resp(conn);
     }
     
     return;
@@ -593,6 +619,7 @@ static void http_ssl_conn_cb(int fd, short event, void *arg)
         TYSCC_LOG(LOG_DEBUG, "ssl connect not complete, skip.");
         return;
     }
+
     event_del(conn->ssl_evt);
     conn->status = HTTP_CONN_STATUS_ASYNC_SSL_CONNECTED;
 
@@ -607,6 +634,7 @@ static void http_ssl_conn_cb(int fd, short event, void *arg)
 
     return;
 }
+#endif
 
 int http_ssl_connect(HTTP_CONN_ST *conn)
 {
@@ -638,8 +666,38 @@ int http_ssl_connect(HTTP_CONN_ST *conn)
     }
     conn->status = HTTP_CONN_STATUS_ASYNC_SSL_CONNECTING;
 
+    #ifdef USE_LIB_EVT
     event_assign(conn->ssl_evt, g_http_evt_base, conn->skfd, EV_READ | EV_PERSIST | EV_ET, http_ssl_conn_cb, (void *)conn);
     event_add(conn->ssl_evt, NULL);
+    #else
+    int ret = -1;
+    fd_set read_fds;
+    while (1) {
+	    FD_ZERO(&read_fds);
+	    FD_SET(conn->skfd, &read_fds);
+	    ret = select(conn->skfd + 1,&read_fds, NULL, NULL, NULL);
+	    if(FD_ISSET(conn->skfd, &read_fds)) {
+		    TYSCC_LOG(LOG_DEBUG, "SSL conned1(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
+		    if (http_ssl_do_connect(conn) == 0) {
+		    	TYSCC_LOG(LOG_DEBUG, "SSL conned2(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
+			break;
+		    }
+	    }
+    }
+    conn->status = HTTP_CONN_STATUS_ASYNC_SSL_CONNECTED;
+    if (http_ssl_write(conn, conn->http_data, strlen(conn->http_data)) < 0) {
+        TYSCC_LOG(LOG_ERR, "http ssl write failed.");
+        return;
+    }
+
+    FD_ZERO(&read_fds);
+    FD_SET(conn->skfd, &read_fds);
+    ret = select(conn->skfd + 1,&read_fds, NULL, NULL, NULL);
+    if(FD_ISSET(conn->skfd, &read_fds)) {
+	    TYSCC_LOG(LOG_DEBUG, "read data(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
+	    http_ssl_read_resp(conn);
+    }
+    #endif
 
     return 0;
 
@@ -747,6 +805,7 @@ int http_ssl_post()
     return 0;
 }
 
+#ifdef USE_LIB_EVT
 struct timeval g_timeout;
 static void http_timer_cb(int fd, short kind, void *userp)
 {
@@ -802,6 +861,7 @@ void *http_worker(void *args)
 
     return NULL;
 }
+#endif
 
 void sa_s_handler(int iSigNum)
 {
@@ -809,9 +869,11 @@ void sa_s_handler(int iSigNum)
 
     TYSCC_LOG(LOG_DEBUG, "sig num = %d", iSigNum);
 
+    #ifdef USE_LIB_EVT
     if (g_http_evt_base) {
         ret = event_base_loopexit(g_http_evt_base, NULL);
     }
+    #endif
 
     sleep(10);
 
@@ -853,7 +915,9 @@ int main(void)
 
     http_ssl_global_init();
 
+    #ifdef USE_LIB_EVT
     pthread_create(&tid, NULL, http_worker, NULL);
+    #endif
 
     http_ssl_post();
 
