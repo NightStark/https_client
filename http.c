@@ -50,6 +50,17 @@ static const char *g_http_post_header_fmt  =
 "\r\n"
 "%s" ;
 
+static const char *g_http_get_header_fmt  = 
+"GET %s HTTP/1.1\r\n"
+"cache-control: no-cache\r\n"
+"User-Agent: %s\r\n"
+"Accept: */*\r\n"
+"Host: %s\r\n"
+"accept-encoding: gzip, deflate\r\n"
+"Connection: keep-alive\r\n"
+"\r\n";
+
+#ifdef USE_LIB_EVT
 static struct event_base *g_http_evt_base = NULL;
 static struct event *g_http_timer_evt = NULL;
 struct evdns_base * g_http_evdns_base = 0; //TODO:need a lock?
@@ -57,6 +68,7 @@ struct evdns_base * g_http_evdns_base = 0; //TODO:need a lock?
 __MUTEX_STATIC(g_http_evt_base_mutex, PTHREAD_MUTEX_INITIALIZER);
 #define HTTP_EVT_BASE_LOCK __MUTEX_LOCK(g_http_evt_base_mutex)
 #define HTTP_EVT_BASE_UNLOCK __MUTEX_UNLOCK(g_http_evt_base_mutex)
+#endif
 
 typedef enum http_conn_status
 {
@@ -85,6 +97,8 @@ typedef struct
     struct evdns_base *evdns_base;
     char http_data[1024];
     HTTP_CONN_STATUS_EN status;
+    char *resp_buf;
+    FILE *resp_file_fp;
 }HTTP_CONN_ST;
 
 int http_ssl_write(HTTP_CONN_ST *conn, const char *text, int len);
@@ -524,11 +538,25 @@ HTTP_CONN_ST * http_ssl_conn_creat(const char *hostname, const char *req_data)
         return NULL;
     }
 
+#if 0
     snprintf(conn->http_data, sizeof(conn->http_data), g_http_post_header_fmt, 
             "/smarthome-api/v1.1/gateway/signup",
             "POSTMAN",
             hostname,
             strlen(req_data), req_data);
+#else
+    snprintf(conn->http_data, sizeof(conn->http_data), g_http_get_header_fmt, 
+            //"/smarthome-api/v1.1/zigbee/whiteList?apiKey=c3a72c78*afd3*4c0d*aae6*9eaa6d9dd189&amp;topologySn=H2ZT121708080061",
+	    "/myapp/qqteam/pcqq/QQ9.0.7.exe",
+            "POSTMAN",
+            hostname);
+#endif
+
+    FILE *resp_file_fp = NULL;
+
+    resp_file_fp = fopen("XX.data", "a+");
+
+    conn->resp_file_fp = resp_file_fp;
 
     if (http_request_start(conn) < 0) {
         return NULL;
@@ -566,20 +594,54 @@ static int http_ssl_do_connect(HTTP_CONN_ST *conn)
     return 0;
 }
 
+int total_size = 0;
+int http_head_len = 0;
 static int http_ssl_read_resp(HTTP_CONN_ST *conn)
 {
         char buf[4096] = {0};
         int ret = -1;
         int ret_err = -1;
-        conn->status = HTTP_CONN_STATUS_ASYNC_HTTP_RESP_HANDLE;
-        //do {
-            memset(buf, 0, sizeof(buf));
-            ret = SSL_read(conn->ssl_handle, buf, sizeof(buf));
-            TYSCC_LOG(LOG_DEBUG, "ssl read evt handle. errno:%d.", errno);
-            ret_err = SSL_get_error(conn->ssl_handle, ret);
-        //} while(errno == EAGAIN);
-        //} while (ret_err == SSL_ERROR_WANT_READ);
-        TYSCC_LOG(LOG_ERR, "buf[%s].ret_err[%d]", buf, ret_err);
+	conn->status = HTTP_CONN_STATUS_ASYNC_HTTP_RESP_HANDLE;
+	printf("+");
+	memset(buf, 0, sizeof(buf));
+	ret = SSL_read(conn->ssl_handle, buf, sizeof(buf));
+	if (ret < 0) {
+	}
+	printf("-");
+	ret_err = SSL_get_error(conn->ssl_handle, ret);
+	if (ret_err == SSL_ERROR_WANT_READ) {
+		printf("A");
+		return 1;
+	} else if (ret_err == SSL_ERROR_NONE) {
+		//printf("ret = %d\n", ret);
+		if (ret < 0) {
+			return 1;
+		}
+		if (total_size == 0) {
+			TYSCC_LOG(LOG_ERR, "buf[%s]", buf);
+			char *data = NULL;
+			data = strstr(buf, "\r\n\r\n");
+			TYSCC_LOG(LOG_ERR, "data  = %08X", data);
+			http_head_len = (data - buf) + 4;
+			TYSCC_LOG(LOG_ERR, "http head len = %d", http_head_len);
+
+			fwrite((char *)buf + http_head_len, (ret - http_head_len), 1, conn->resp_file_fp);
+			total_size += (ret - http_head_len);
+		} else {
+			fwrite(buf, ret, 1, conn->resp_file_fp);
+			total_size += ret;
+		}
+		//TYSCC_LOG(LOG_ERR, "len = %d", total_size);
+		printf("D");
+		if (ret != sizeof(buf)) {
+			printf("E\n");
+			return 0;
+		}
+		return 1;
+	} else {
+		printf("E\n");
+		return 0;
+	}
 }
 
 
@@ -690,13 +752,21 @@ int http_ssl_connect(HTTP_CONN_ST *conn)
         return;
     }
 
-    FD_ZERO(&read_fds);
-    FD_SET(conn->skfd, &read_fds);
-    ret = select(conn->skfd + 1,&read_fds, NULL, NULL, NULL);
-    if(FD_ISSET(conn->skfd, &read_fds)) {
-	    TYSCC_LOG(LOG_DEBUG, "read data(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
-	    http_ssl_read_resp(conn);
+    while (1) {
+	    FD_ZERO(&read_fds);
+	    FD_SET(conn->skfd, &read_fds);
+	    ret = select(conn->skfd + 1,&read_fds, NULL, NULL, NULL);
+	    if(FD_ISSET(conn->skfd, &read_fds)) {
+		    //TYSCC_LOG(LOG_DEBUG, "read data(%08X), skfd:%d", (unsigned int)conn, conn->skfd);
+		    if (!http_ssl_read_resp(conn)) {
+			    break;
+		    }
+	    }
     }
+
+    		fclose(conn->resp_file_fp);
+		conn->resp_file_fp = NULL;
+		TYSCC_LOG(LOG_ERR, "total len = %d", total_size);
     #endif
 
     return 0;
@@ -795,7 +865,7 @@ int http_ssl_post()
     const char *post_data = "gatewaySn=201703091158&macAddress=20-17-03-09-11-58&vendorId=HUADI&productId=GZ6200&hardwareVersion=20160608&softwareVersion=20160608&moduleList=%5B%7B%22moduleSn%22%3A%22MODULE-ZIGBEE-0001%22%2C%22vendorCode%22%3A%22HUADI%22%2C%22productCode%22%3A%22M1-001%22%2C%22moduleType%22%3A%22zigbee%22%2C%22macAddress%22%3A%2211-22-33-44-55-66%22%7D%5D\r\n\r\n";
 
     while(1) {
-        conn = http_ssl_conn_creat("apis.t2.5itianyuan.com", post_data);
+        conn = http_ssl_conn_creat("qd.myapp.com", post_data);
         if (conn) {
             break;
         }
